@@ -1,75 +1,32 @@
-me · MD
+nshift full journey · MD
 
-# GitLab Runner on OpenShift — Complete Setup Guide
+# GitLab Runner on OpenShift — Full Journey Documentation
 
-**Author:** Senior OpenShift Engineer  
-**Environment:** Air-gapped (no internet access) | ROSA (Red Hat OpenShift Service on AWS)  
-**Goal:** Host a GitLab Runner inside OpenShift so teams can use their own images in CI/CD pipelines
+**Author:** Senior OpenShift/Containers Engineer  
+**Environment:** Air-gapped ROSA (Red Hat OpenShift Service on AWS)  
+**Local Dev:** Windows laptop with WSL2 (Ubuntu) + Docker Desktop  
+**Goal:** Host a GitLab Runner in OpenShift so teams use their own images in CI/CD pipelines  
+**Approach:** GitLab repo holds Dockerfile → OpenShift BuildConfig builds image internally → Deployment runs the runner
+
+> This document is a full history of everything we did, every pivot, every debug step, and why. Nothing is skipped.
 
 ---
 
 ## Table of Contents
 
-1. [Overview and Architecture](#overview-and-architecture)
-2. [Key Terminology](#key-terminology)
-3. [Variable Reference](#variable-reference)
-4. [Environment Setup](#environment-setup)
-5. [Understanding the Air-Gap Problem](#understanding-the-air-gap-problem)
-6. [Docker Concepts](#docker-concepts)
-7. [Building the GitLab Runner Image](#building-the-gitlab-runner-image)
-8. [OpenShift BuildConfig Setup](#openshift-buildconfig-setup)
-9. [Deploying the Runner](#deploying-the-runner)
-10. [Pivots and Why We Made Them](#pivots-and-why-we-made-them)
-11. [Enterprise JFrog Example](#enterprise-jfrog-example)
+1. [Key Terminology](#key-terminology)
+2. [Variable Reference](#variable-reference)
+3. [Environment Setup](#environment-setup)
+4. [Understanding the Air-Gap](#understanding-the-air-gap)
+5. [Docker Concepts](#docker-concepts)
+6. [Deployment vs Job — The Core Confusion](#deployment-vs-job)
+7. [The Full OpenShift + GitLab Journey](#the-full-journey)
+8. [All Dockerfile Versions](#all-dockerfile-versions)
+9. [All Pivots and Why](#all-pivots-and-why)
+10. [Deployment Setup](#deployment-setup)
+11. [Enterprise JFrog Version](#enterprise-jfrog-version)
 12. [Troubleshooting Reference](#troubleshooting-reference)
-
----
-
-## Overview and Architecture
-
-### What We Are Building
-
-A GitLab Runner hosted inside OpenShift that allows development teams to run CI/CD pipelines using their own custom Docker images — without any container needing to reach the internet.
-
-```
-GitLab (internal)
-        │
-        │  "I have a pipeline job"
-        ▼
-GitLab Runner Pod (Deployment — runs forever)
-        │
-        │  spins up a new job pod per pipeline
-        ▼
-Job Pod (runs team's image, exits when done)
-        │
-        ▼
-Results reported back to GitLab ✓
-```
-
-### Why OpenShift Instead of EC2
-
-| EC2 Runner                     | OpenShift Runner               |
-| ------------------------------ | ------------------------------ |
-| Installed as a Linux service   | Deployed as a pod (Deployment) |
-| You manage the OS              | OpenShift manages the pod      |
-| Crashes require manual restart | Self-healing — auto restarts   |
-| One machine                    | Scales automatically           |
-| Shell or Docker executor       | Kubernetes executor            |
-
-### What Teams Get
-
-Once the runner is deployed, each team defines their own image in `.gitlab-ci.yml`:
-
-```yaml
-# Each team's pipeline — completely independent of your runner image
-job:
-  image: your-registry/their-custom-image:latest
-  script:
-    - echo "Running in my own image"
-    - python3 myscript.py
-```
-
-Your runner receives the job, spins up a pod using their image, runs it, and reports back. The runner image and the job image are completely separate.
+13. [Quick Reference Commands](#quick-reference-commands)
 
 ---
 
@@ -77,548 +34,1039 @@ Your runner receives the job, spins up a pod using their image, runs it, and rep
 
 ### Docker / Container Concepts
 
-**Image** — A read-only blueprint of a container. Stored in a registry. Built from a Dockerfile. Think of it as a recipe — it never changes.
+**Image** — A read-only blueprint of a container. Like a recipe — never changes. Stored in a registry. Built from a Dockerfile.
 
-**Container** — A running instance of an image. Think of it as the meal made from the recipe. One image can spawn many containers.
+**Container** — A running instance of an image. Like the meal made from the recipe. One image spawns many containers. Writable layer is lost when container stops.
 
-**Dockerfile** — A text file containing instructions that Docker executes top to bottom to build an image. Each instruction creates one layer.
+**Dockerfile** — A text file of instructions Docker executes top-to-bottom to build an image. Each instruction creates one immutable layer.
 
-**Layer** — A cached snapshot of changes made by one Dockerfile instruction. Layers stack on top of each other to form the final image.
+**Layer** — A cached snapshot of filesystem changes from one Dockerfile instruction. Layers stack. Unchanged layers are reused on rebuild.
 
-**Registry** — A storage server for images. Examples: JFrog Artifactory, OpenShift internal registry, Docker Hub.
+**Registry** — A storage server for images. JFrog Artifactory, OpenShift internal registry, and Docker Hub are all registries.
 
-**docker build** — The command that reads a Dockerfile and produces an image on your local machine.
+**docker build** — Reads a Dockerfile, executes instructions, produces an image locally.
 
-**docker push** — The command that uploads a locally built image to a registry.
+**docker push** — Uploads a locally built image to a registry.
 
-**docker pull** — The command that downloads an image from a registry to your local machine.
+**docker pull** — Downloads an image from a registry to your machine.
 
-**UBI9** — Universal Base Image 9. A minimal Red Hat Enterprise Linux 9 OS packaged as a container base image. Built and maintained by Red Hat. Free to use. Preferred in enterprise OpenShift environments because it is RHEL-compatible and security-certified.
+**UBI9** — Universal Base Image 9. Minimal RHEL9 OS packaged as a container base image. Built and maintained by Red Hat. Free to use. Has `rpm`, `dnf`, `yum` built in. Does NOT have Python, Java, or any runtime — it is a foundation, not an application.
+
+**ARG** — Dockerfile build-time variable. Only exists during `docker build`. NOT available at container runtime. Injected by BuildConfig from secrets.
+
+**CMD** — The command that runs when the container starts. Long-running CMD keeps Deployment alive. Exiting CMD causes CrashLoopBackOff in a Deployment.
+
+**RUN** — Dockerfile instruction that executes a shell command during build. Baked into image as a layer.
 
 ### OpenShift Concepts
 
-**Pod** — The smallest deployable unit in OpenShift/Kubernetes. Wraps one or more containers.
+**Pod** — Smallest deployable unit. Wraps one or more containers.
 
-**Deployment** — Manages pods that need to run continuously (web servers, APIs, daemons). If a pod exits for any reason, the Deployment restarts it. This is why a script-based container will CrashLoopBackOff — it exits on purpose but the Deployment thinks something went wrong.
+**Deployment** — Manages pods that run forever. Any exit = restart. CrashLoopBackOff when container keeps exiting. Use for: web servers, APIs, the GitLab runner itself.
 
-**Job** — Manages pods designed to run once and exit. When the container exits with code 0, the Job marks it complete. No restart loop.
+**Job** — Manages pods that run once and exit. Exit code 0 = done. No restart. Use for: scripts, migrations, one-time tasks.
 
-**CronJob** — Like a Job but triggered on a schedule (e.g. every night at midnight).
+**CrashLoopBackOff** — Pod keeps crashing and restarting. Most common causes: wrong workload type (Job logic in Deployment), missing config, running as root blocked by SCC.
 
-**CrashLoopBackOff** — OpenShift error state meaning a pod keeps crashing and restarting. Usually means the container exits unexpectedly. Most common causes: wrong workload type (should be a Job), missing config, running as root when not allowed.
+**BuildConfig** — OpenShift resource defining how to build an image from source. Watches a Git repo, builds on push, outputs to ImageStream. Solves the firewall/push problem.
 
-**BuildConfig** — An OpenShift resource that defines how to build a container image from source code. Can watch a Git repo and trigger builds automatically.
+**ImageStream** — OpenShift image tracking layer. Must exist before BuildConfig can output to it. Created with `oc create imagestream`.
 
-**ImageStream** — OpenShift's internal image tracking system. A pointer to image versions stored in the internal registry. BuildConfigs output to ImageStreams.
+**Secret** — Stores sensitive data base64-encoded. Two types matter here:
 
-**ServiceAccount** — An identity that pods use to make API calls within the cluster. The GitLab runner needs a ServiceAccount with permission to create job pods.
+- `kubernetes.io/basic-auth` — Required for git source auth in BuildConfig. Must have `username` and `password` keys.
+- `Opaque` — Generic. Used for build arg injection.
+  **ConfigMap** — Non-sensitive config as key-value. We mount `config.toml` into runner pod via ConfigMap.
 
-**ConfigMap** — Stores non-sensitive configuration data (like `config.toml`) and mounts it into pods as files.
+**ServiceAccount** — Identity for pods making API calls within cluster. Runner needs one with permission to create job pods.
 
-**Secret** — Stores sensitive data (tokens, passwords) and makes them available to pods. Base64 encoded at rest.
+**SCC (Security Context Constraint)** — OpenShift security policy. Default `restricted` blocks root (UID 0) containers. Why `USER 1001` is non-negotiable.
 
-**SCC (Security Context Constraint)** — OpenShift's security policy for pods. The default `restricted` SCC blocks containers that run as root. This is why `USER 1001` in the Dockerfile is critical.
+**Route** — Exposes service outside cluster. Used to expose internal registry for docker push.
 
-**Namespace / Project** — An isolated workspace inside the cluster. All your resources live in a namespace. Developer Sandbox gives you one pre-created namespace.
-
-**Route** — An OpenShift resource that exposes a service to external traffic. Used to expose the internal registry for pushing images.
+**Namespace/Project** — Isolated workspace. Developer Sandbox gives you `yourname-dev` pre-created.
 
 ### GitLab Runner Concepts
 
-**Executor** — How the runner actually runs pipeline jobs. Options: Shell (on the runner machine), Docker (in a container on the runner), Kubernetes (in a new pod on the cluster). We use the **Kubernetes executor** because we are on OpenShift.
+**Executor** — How runner runs jobs. We use `kubernetes` (creates new pod per job). Do NOT use `docker` (needs Docker socket, blocked in OpenShift).
 
-**Helper Image** — A second image used by GitLab Runner 17+ alongside the job image. Handles: cloning the repo, uploading artifacts, managing cache. Required as a separate RPM package starting in GitLab Runner 17.
+**Helper Image** — Required by GitLab Runner 17+. Handles: cloning repo, uploading artifacts, cache. Comes as separate RPM. Both RPMs must be same version.
 
-**Registration Token** — A secret token from GitLab that proves your runner is authorized to receive jobs for a specific project or group.
+**Registration Token** — From GitLab CI/CD settings. Proves runner is authorized. Different from personal access token.
 
-**config.toml** — The runner's main configuration file. Defines GitLab URL, token, executor type, namespace, and job image defaults.
+**config.toml** — Runner's main config. Defines GitLab URL, executor, namespace, images. Mounted via ConfigMap.
 
-**clone_url** — A config.toml setting that overrides the URL the runner uses to clone repositories. Critical in air-gapped environments where the default GitLab URL might not be reachable from inside pods.
+**clone_url** — config.toml override for URL used to clone repos during jobs. Critical in air-gapped environments.
 
 ---
 
 ## Variable Reference
 
-This section explains every variable used in this guide, distinguishing between shell exports (set by you) and references (used by tools/configs).
-
 ### Shell Exports (You Set These)
-
-These are set in your terminal session with `export`. They are your credentials and identifiers.
 
 ```bash
 export GITLAB_TOKEN="glpat-xxxxxxxxxxxx"
 # Your GitLab Personal Access Token
-# Created at: GitLab → Preferences → Access Tokens
-# Required scopes: api, read_repository, write_repository
-# Used for: authenticating git clone, uploading to Package Registry
-# NEVER commit this to git
+# Where: GitLab → Preferences → Access Tokens
+# Required scopes: api (covers everything including package registry)
+# REVOKE AND REGENERATE if ever shared in logs or chat
 
 export PROJECT_ID="82861465"
-# Your GitLab project's numeric ID
-# Found at: GitLab → your repo → Settings → General → Project ID
-# Used for: GitLab API calls to Package Registry
+# Your GitLab project numeric ID — not sensitive
+# Where: GitLab → your repo → Settings → General → top of page
 
-export JFROG_URL="your-instance.jfrog.io"
-# (Enterprise only) Your JFrog Artifactory instance URL
-# Used for: pulling base images, downloading RPMs
+# Persist in WSL so terminal restarts don't clear them
+echo 'export GITLAB_TOKEN="your-token"' >> ~/.bashrc
+echo 'export PROJECT_ID="82861465"' >> ~/.bashrc
+source ~/.bashrc
 
-export JFROG_TOKEN="your-jfrog-api-key"
-# (Enterprise only) JFrog API key or identity token
-# Created at: JFrog → Edit Profile → Authentication Settings
-# Use API key not identity token in air-gapped environments
-# Identity tokens are short-lived and cause pull failures
+# Update when token changes
+sed -i '/GITLAB_TOKEN/d' ~/.bashrc
+echo 'export GITLAB_TOKEN="new-token"' >> ~/.bashrc
 ```
 
-### OpenShift Secrets (Stored in Cluster)
+### OpenShift Secrets
 
-These are stored as Kubernetes Secrets and injected into builds/pods at runtime.
+```
+Secret: gitlab-git-auth
+  Type: kubernetes.io/basic-auth    ← MUST be this exact type for git source auth
+  Keys: username, password          ← MUST be these exact key names
+  Used for: BuildConfig cloning from GitLab
 
-```bash
-# Secret: gitlab-git-auth
-# Type: kubernetes.io/basic-auth
-# Keys: username, password
-# Used for: BuildConfig cloning from private GitLab repos
-# Why basic-auth type: OpenShift requires this specific type for git source auth
-
-# Secret: gitlab-build-args
-# Type: Opaque (generic)
-# Keys: token, project-id
-# Used for: passing credentials into Dockerfile ARG during build
-# Note: key names must exactly match what BuildConfig references
-
-# Secret: jfrog-pull-secret (enterprise)
-# Type: kubernetes.io/dockerconfigjson
-# Used for: OpenShift nodes authenticating to JFrog to pull images
+Secret: gitlab-build-args
+  Type: Opaque
+  Keys: token, project_id           ← use underscore not hyphen
+  Used for: injecting into Dockerfile ARG during build
 ```
 
-### Dockerfile ARGs (Build-Time Variables)
-
-ARG variables exist only during `docker build` / OpenShift build. They are NOT available at container runtime.
+### Dockerfile ARG Variables (Build-Time Only)
 
 ```dockerfile
 ARG PKG_TOKEN
-# Renamed from GITLAB_TOKEN to avoid GitLab's secret push detection
-# Value injected by BuildConfig from gitlab-build-args secret
-# Used in curl commands to authenticate Package Registry downloads
+# Originally named GITLAB_TOKEN
+# Renamed because GitLab secret push scanner blocked the push
+# even with no hardcoded value — GITLAB_TOKEN matched secret patterns
+# Value from: BuildConfig buildArgs → gitlab-build-args secret → key: token
+# NOT available at container runtime
 
 ARG PROJECT_ID
-# GitLab project numeric ID
-# Value injected by BuildConfig (hardcoded or from secret)
-# Used in Package Registry API URL construction
+# Originally from secret via secretKeyRef — proved unreliable in Sandbox
+# Final solution: hardcoded in BuildConfig as value: "82861465"
+# Not sensitive — visible in GitLab URL anyway
 ```
 
 ### config.toml Variables
 
 ```toml
-url = "http://your-internal-gitlab-url"
-# The GitLab instance the runner registers with and polls for jobs
-# Must be reachable from inside OpenShift pods
-
-token = "your-registration-token"
-# NOT your personal access token
-# This is the runner registration token from:
-# GitLab → Settings → CI/CD → Runners → Registration token
-# Obtained by running: gitlab-runner register
-
-clone_url = "http://your-internal-gitlab-url"
-# Overrides the URL used to clone repos during pipeline jobs
-# Critical in air-gapped environments
-# Without this, runner uses whatever URL GitLab advertises
-# which may be external/unreachable from inside pods
-
-namespace = "your-namespace"
-# The OpenShift namespace where job pods will be created
-# Must match where the runner Deployment lives
-
-image = "registry/namespace/ubi9:latest"
-# Default image for job pods when pipeline doesn't specify one
-# Should point to internal registry in air-gapped environments
-
-helper_image = "registry/namespace/gitlab-runner:latest"
-# The helper image used alongside job pods
-# Handles: git clone, artifact upload, cache management
-# Must be in internal registry in air-gapped environments
+url          # GitLab instance URL — where runner registers and polls
+token        # Runner registration token — from GitLab CI/CD settings
+clone_url    # Override URL for repo cloning — critical in air-gapped envs
+namespace    # OpenShift namespace where job pods are created
+image        # Default job pod image when pipeline does not specify one
+helper_image # Helper image for git clone/artifact upload — must be internal
 ```
 
 ---
 
 ## Environment Setup
 
-### Prerequisites
+### Windows Laptop → WSL → Linux
 
-On your workstation (WSL on Windows or native Linux):
+```powershell
+# In PowerShell as Administrator
+wsl --install
+# Installs WSL2 + Ubuntu. Restart laptop when prompted.
+```
+
+**Forgot WSL sudo password:**
+
+```powershell
+# PowerShell as Administrator
+wsl -u root
+# Inside WSL root shell:
+cat /etc/passwd | grep home    # find your username
+passwd yourusername            # nothing shows while typing — normal
+exit
+```
+
+### Docker Desktop WSL Integration
+
+```
+Docker Desktop → Settings → Resources → WSL Integration
+→ Enable integration with my default WSL distro: ON
+→ Ubuntu: ON
+→ Apply & Restart
+```
+
+Without this, `docker` inside WSL gives:
+
+```
+The command 'docker' could not be found in this WSL 2 distro.
+We recommend to activate the WSL integration in Docker Desktop settings.
+```
+
+### Install oc CLI in WSL
 
 ```bash
-# 1. Docker
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-# If using Docker Desktop on Windows — enable WSL integration in Docker Desktop settings
-
-# 2. oc CLI
 curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz
 tar xvf openshift-client-linux.tar.gz
 sudo mv oc /usr/local/bin/
 oc version
-
-# 3. Login to OpenShift
-# Get login command from: OpenShift Console → top right → Copy Login Command
-oc login --token=sha256~xxxxx \
-  --server=https://api.your-cluster.openshiftapps.com:6443
-
-# 4. Check your namespace
-oc project
+# Client Version: 4.21.18
+# Server Version: 4.21.15  ← Server showing means already connected
 ```
 
-### Persist Variables Across Sessions
-
-WSL clears environment variables when the terminal closes. Persist them:
+### OpenShift Developer Sandbox Login
 
 ```bash
-echo 'export GITLAB_TOKEN="your-token"' >> ~/.bashrc
-echo 'export PROJECT_ID="your-project-id"' >> ~/.bashrc
-source ~/.bashrc
+# Get login command: OpenShift Console → top right → Copy Login Command
+oc login --token=sha256~xxxxx \
+  --server=https://api.sandbox-m2.ll9k.p1.openshiftapps.com:6443
+
+oc project
+# Using project "aaroncodes-dev"
 ```
 
 ---
 
-## Understanding the Air-Gap Problem
-
-This is the most important concept to understand. There are three separate network paths and they are NOT the same.
+## Understanding the Air-Gap
 
 ```
 Path 1: Your workstation → GitLab/JFrog
-─────────────────────────────────────────
-Your workstation is on the corporate network.
-GitLab and JFrog are also on the corporate network.
-This path is WHITELISTED. You can browse GitLab in Chrome,
-run docker pull from JFrog, and clone git repos.
+  Same corporate network. WHITELISTED.
+  Chrome works, docker pull works, git clone works.
 
-Path 2: Your workstation → OpenShift API
-─────────────────────────────────────────
-The oc CLI communicates with the OpenShift API server.
-This path is WHITELISTED. That is why oc commands work.
+Path 2: Your workstation → OpenShift API (port 6443)
+  oc CLI communicates here. WHITELISTED.
+  All oc commands work.
 
 Path 3: OpenShift nodes → External registries
-──────────────────────────────────────────────
-OpenShift worker nodes live on a DIFFERENT subnet.
-Their outbound traffic goes through different firewall rules.
-This path is BLOCKED for most external destinations.
-This is why pods cannot pull images from the internet
-and why docker push to an external registry fails.
+  Nodes on DIFFERENT subnet. BLOCKED.
+  docker push from workstation to registry route = blocked.
+  Pods cannot pull images from internet.
 ```
 
-### Why You Can Open JFrog in Chrome But Pods Can't Pull From It
-
-Your browser and your Docker client share your workstation's network identity. OpenShift nodes have their own network identity on a separate subnet. The whitelist controls traffic by source IP. Your workstation's IP is allowed. The node's IP is not (without explicit whitelisting).
-
-### The Solution: Internal Registry
-
-```
-Step 1: Pull image to your workstation     (Path 1 — allowed)
-Step 2: Push to OpenShift internal registry (Path 2 — allowed via oc)
-Step 3: Pods pull from internal registry   (internal cluster traffic — always allowed)
-```
-
-Pods can always reach the OpenShift internal registry because it lives inside the same cluster network.
+**Why BuildConfig solves this:**
+BuildConfig uses Path 2 (already working oc connection) to send source into OpenShift. The build runs internally. No external push needed.
 
 ---
 
 ## Docker Concepts
 
-### How a Dockerfile Builds an Image
-
-Each instruction in a Dockerfile creates one read-only layer. Layers are cached — if nothing changed in a layer, Docker reuses the cached version.
+### Dockerfile Layers
 
 ```dockerfile
-FROM ubi9:latest                    # Layer 1: base OS
-COPY gitlab-runner.rpm /tmp/        # Layer 2: RPM file added
-RUN rpm -ivh /tmp/gitlab-runner.rpm # Layer 3: RPM installed
-RUN mkdir -p /etc/gitlab-runner     # Layer 4: directory created
-USER 1001                           # Layer 5: user set
-CMD ["gitlab-runner", "run"]        # Layer 6: startup command set
+FROM ubi9:latest                              # Layer 1: base OS
+COPY gitlab-runner.rpm /tmp/                  # Layer 2: file added
+RUN rpm -ivh /tmp/gitlab-runner.rpm           # Layer 3: installed
+RUN mkdir -p /etc/gitlab-runner              # Layer 4: dir created
+USER 1001                                     # Layer 5: user set
+CMD ["gitlab-runner", "run"]                  # Layer 6: startup cmd
+```
+
+**Chain commands to reduce layers:**
+
+```dockerfile
+# WRONG - 3 layers, RPM stays in layer 1 even after deletion
+RUN rpm -ivh /tmp/gitlab-runner.rpm
+RUN dnf clean all
+RUN rm -f /tmp/gitlab-runner.rpm
+
+# CORRECT - 1 layer
+RUN rpm -ivh /tmp/gitlab-runner.rpm && \
+    dnf clean all && \
+    rm -f /tmp/gitlab-runner.rpm
 ```
 
 ### RUN vs CMD
 
 ```
-RUN  → executes during docker build — baked into the image
-CMD  → executes when a container starts from the image
+RUN  → during docker build → baked into image permanently
+CMD  → when container starts → what the container actually does
 ```
 
-`RUN` is construction. `CMD` is what the building does when occupied.
+### USER 1001 — Non-Negotiable for OpenShift
 
-### Why USER 1001 is Critical for OpenShift
-
-By default Docker images run as root (UID 0). OpenShift's default Security Context Constraint (`restricted`) blocks root containers. Without `USER 1001`, your pod starts, hits the SCC restriction, and enters CrashLoopBackOff with empty logs. Setting a non-root UID in the Dockerfile fixes this before it becomes a problem.
-
-### Deployment vs Job — The Most Common Confusion
-
-This caused significant debugging time. Understanding this distinction is essential.
+OpenShift default SCC blocks root (UID 0). Without `USER 1001`:
 
 ```
-Deployment
-  └── Expects container to run FOREVER
-  └── Any exit = failure = restart
-  └── Use for: web servers, APIs, daemons, the GitLab runner itself
+Pod starts → SCC check → container wants root → denied
+→ CrashLoopBackOff with EMPTY LOGS
+```
 
-Job
-  └── Expects container to run ONCE and exit
-  └── Exit code 0 = success = done
-  └── Use for: scripts, migrations, one-time tasks
+Empty logs is the tell — it never even started.
 
-A UBI9 base image with no CMD will:
-  ✓ Complete successfully as a Job (exits immediately with 0)
-  ✗ CrashLoop forever as a Deployment (keeps restarting the exited container)
+---
+
+## Deployment vs Job
+
+This caused the initial CrashLoopBackOff confusion:
+
+```
+Deployment = runs forever
+  Any exit (even code 0) = OpenShift restarts it
+  CrashLoopBackOff = container keeps exiting
+  Use for: web servers, APIs, daemons, GitLab runner
+
+Job = runs once and exits
+  Exit code 0 = success = complete
+  No restart
+  Use for: scripts, migrations, one-time tasks
+```
+
+**The UBI9 confusion:**
+Bare UBI9 has no CMD. Starts, does nothing, exits with code 0.
+
+- As a Job: success
+- As a Deployment: infinite restart loop → CrashLoopBackOff
+  The Deployment vs Job distinction was discovered when our job image worked as a Job but CrashLooped as a Deployment. The ONLY difference was the workload type.
+
+---
+
+## The Full Journey
+
+### Phase 1: WSL and Tools
+
+1. Installed WSL2: `wsl --install`
+2. Enabled Docker Desktop WSL integration
+3. Confirmed `docker version` worked in WSL
+4. Downloaded oc CLI, moved to `/usr/local/bin/`
+5. Logged into Developer Sandbox
+
+### Phase 2: GitLab Repo Setup
+
+#### Creating the Repo
+
+```
+GitLab → New Project → Create blank project
+Name: my-openshift
+Namespace: aortiz122442 (personal account, NOT group)
+Visibility: Private
+```
+
+**Why personal account not group:**
+Initially tried group `freelance-group162023`. Group access tokens were disabled. Personal tokens do not work for group repos. Solution: use personal account where you have full control.
+
+#### Token Creation
+
+```
+GitLab → Preferences → Access Tokens → Add new token
+Name: openshift-sim
+Scopes: api  ← single scope covers everything
+```
+
+**Token Exposure:**
+Token was accidentally shared in conversation. Immediately revoked and regenerated. Any time a token appears in logs or chat — revoke immediately.
+
+#### Git Clone Failures
+
+**Failure 1 — Token in URL:**
+
+```bash
+git clone https://oauth2:glpat-TOKEN@gitlab.com/username/repo.git
+# Error: URL rejected: Port number was not a decimal number between 0 and 65535
+```
+
+Why: Token contained special characters (`:`) interpreted as port separator.
+
+**Fix — credential prompt:**
+
+```bash
+git config --global credential.helper store
+git clone https://gitlab.com/aortiz122442/my-openshift.git
+# Username: aortiz122442
+# Password: paste token
+```
+
+**Failure 2 — Still 403:**
+Error: `remote: You are not allowed to download code from this project`
+
+Fix: Revoke token, create new one with `api` scope while logged in as correct account.
+
+### Phase 3: RPM Downloads
+
+**Failure 1 — Specific version URL:**
+
+```bash
+curl -LJO "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/v17.11.0/rpm/gitlab-runner_x86_64.rpm"
+# Result: 243-byte file
+```
+
+Why: S3 returned `AccessDenied`. Version `v17.11.0` does not exist at that path.
+
+**Fix — use `latest`:**
+
+```bash
+curl -L --progress-bar \
+  "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/rpm/gitlab-runner_x86_64.rpm" \
+  -o gitlab-runner_x86_64.rpm
+# Result: 26MB ✓
+
+curl -L --progress-bar \
+  "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/rpm/gitlab-runner-helper-images.rpm" \
+  -o gitlab-runner-helper-images.rpm
+# Result: 515MB ✓
+```
+
+**Validating RPMs:**
+
+```bash
+head -c 4 gitlab-runner_x86_64.rpm | xxd
+# 00000000: edab eedb  ← correct RPM magic bytes
+# ed ab ee db = valid RPM file signature
+# Any other bytes = not a real RPM
+```
+
+### Phase 4: GitLab Package Registry
+
+#### Purpose
+
+Store RPM binary files in GitLab so OpenShift build can download them. Git is for code. Binaries belong in artifact repositories.
+
+#### Upload Failures
+
+**401 Unauthorized:**
+Token missing scopes. Fix: create token with `api` scope.
+
+**403 Forbidden:**
+Package Registry feature disabled on project.
+Fix: `GitLab → Settings → General → Visibility → Package registry → ON`
+
+**Root cause of bad RPMs in registry:**
+First uploads happened when `GITLAB_TOKEN` was empty. curl received error HTML responses and saved them as RPM files (106-263 bytes). Subsequent builds downloaded these HTML files — yum could not install them.
+
+**Lesson:** Always use `curl -f` to fail immediately on HTTP errors:
+
+```bash
+curl -f --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" URL -o file.rpm
+# Without -f: saves error HTML as the file silently
+```
+
+**Successful upload:**
+
+```bash
+curl --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+     --upload-file gitlab-runner_x86_64.rpm \
+     "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner_x86_64.rpm"
+
+curl --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+     --upload-file gitlab-runner-helper-images.rpm \
+     "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner-helper-images.rpm"
+```
+
+### Phase 5: OpenShift BuildConfig
+
+#### Create ImageStream First
+
+Must exist before build runs. Forgetting this caused:
+
+```
+Status: New (InvalidOutputReference)
+```
+
+```bash
+oc create imagestream gitlab-runner -n aaroncodes-dev
+```
+
+#### Create BuildConfig
+
+```bash
+cat > buildconfig.yaml << 'EOF'
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: gitlab-runner
+spec:
+  source:
+    type: Git
+    git:
+      uri: "https://gitlab.com/aortiz122442/my-openshift.git"
+      ref: main
+    sourceSecret:
+      name: gitlab-git-auth
+  strategy:
+    type: Docker
+    dockerStrategy:
+      buildArgs:
+        - name: PKG_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: gitlab-build-args
+              key: token
+        - name: PROJECT_ID
+          value: "82861465"
+  output:
+    to:
+      kind: ImageStreamTag
+      name: "gitlab-runner:latest"
+EOF
+
+oc apply -f buildconfig.yaml
+```
+
+### Phase 6: Secrets (Multiple Iterations)
+
+**Iteration 1 — Single generic secret (FAILED):**
+
+```bash
+oc create secret generic gitlab-credentials \
+  --from-literal=token=${GITLAB_TOKEN} \
+  --from-literal=project-id=${PROJECT_ID} \
+  -n aaroncodes-dev
+```
+
+Failed because generic Opaque does not work for git source auth. Needs `kubernetes.io/basic-auth`.
+
+**Iteration 2 — Wrong namespace (FAILED):**
+Created without `-n aaroncodes-dev`. Build pod looked in wrong namespace.
+Error: `secret "gitlab-credentials" not found`
+
+**Iteration 3 — Two separate secrets (WORKING):**
+
+```bash
+# Git source authentication — type MUST be kubernetes.io/basic-auth
+# Keys MUST be username and password
+oc create secret generic gitlab-git-auth \
+  --type=kubernetes.io/basic-auth \
+  --from-literal=username=aortiz122442 \
+  --from-literal=password=${GITLAB_TOKEN} \
+  -n aaroncodes-dev
+
+oc annotate secret gitlab-git-auth \
+  "build.openshift.io/source-secret-match-uri-1=https://gitlab.com/*" \
+  -n aaroncodes-dev
+
+# Build arg injection — Opaque type, key names must match BuildConfig exactly
+oc create secret generic gitlab-build-args \
+  --from-literal=token=${GITLAB_TOKEN} \
+  --from-literal=project_id=${PROJECT_ID} \
+  -n aaroncodes-dev
+```
+
+**Verifying secrets:**
+
+```bash
+oc get secret gitlab-build-args \
+  -o jsonpath='{.data.project_id}' -n aaroncodes-dev | base64 -d
+# Should return: 82861465
+
+oc get secret gitlab-build-args \
+  -o jsonpath='{.data.token}' -n aaroncodes-dev | base64 -d | wc -c
+# Should return number > 0
 ```
 
 ---
 
-## Building the GitLab Runner Image
+## All Dockerfile Versions
 
-### Why We Build a Custom Image
-
-GitLab provides official runner Docker images, but in an air-gapped environment these cannot be pulled from the internet. Instead, we have the GitLab runner RPM files stored in JFrog (or GitLab Package Registry for learning). We install them onto a UBI9 base image to create our own runner image.
-
-### GitLab Runner 17 — Two Required RPMs
-
-Starting with GitLab Runner 17, the helper images were split into a separate package. Both must be installed:
-
-| RPM                               | Purpose                           | Typical Size |
-| --------------------------------- | --------------------------------- | ------------ |
-| `gitlab-runner_x86_64.rpm`        | The runner binary itself          | ~26MB        |
-| `gitlab-runner-helper-images.rpm` | Pre-built helper container images | ~500MB       |
-
-Both must be the SAME version. Mismatched versions cause dependency errors.
-
-### The Dockerfile
+### Version 1 — Initial
 
 ```dockerfile
-FROM ubi9:latest
+FROM your-jfrog-url/ubi9:latest
 
-# Copy RPMs from local build context into the image
-COPY gitlab-runner_x86_64.rpm /tmp/gitlab-runner.rpm
-COPY gitlab-runner-helper-images.rpm /tmp/gitlab-runner-helper-images.rpm
+COPY gitlab-runner.rpm /tmp/gitlab-runner.rpm
 
-# Fix permissions after copy (prevents "Can not load RPM file" errors)
-RUN chmod 644 /tmp/gitlab-runner.rpm \
-              /tmp/gitlab-runner-helper-images.rpm
+RUN rpm -ivh /tmp/gitlab-runner.rpm && \
+    rm -f /tmp/gitlab-runner.rpm
 
-# Install both RPMs using dnf localinstall
-# dnf localinstall is preferred over yum install for local RPM files
-# It handles dependencies automatically and is the correct command for this use case
-RUN dnf localinstall -y /tmp/gitlab-runner.rpm \
-                        /tmp/gitlab-runner-helper-images.rpm && \
-    dnf clean all && \
-    rm -f /tmp/*.rpm
-# dnf clean all removes yum cache to keep image size smaller
-# rm -f removes the RPM files — no point keeping them after install
-
-# Create required directories
-# Runner crashes on startup if these don't exist
 RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
 
-# CRITICAL for OpenShift: run as non-root
-# OpenShift's restricted SCC blocks root (UID 0) containers
-# Without this line the pod will CrashLoopBackOff with empty logs
-USER 1001
-
-# CMD is what keeps the Deployment alive
-# gitlab-runner run is a long-running process that polls GitLab for jobs
-# It never exits on its own — perfect for a Deployment
 CMD ["gitlab-runner", "run", \
      "--working-directory", "/home/gitlab-runner", \
      "--config", "/etc/gitlab-runner/config.toml"]
 ```
 
-### Build Folder Structure
-
-```
-gitlab-runner-build/
-    ├── Dockerfile                       ← pushed to GitLab repo
-    ├── .gitignore (contains *.rpm)      ← prevents RPMs from going into git
-    ├── gitlab-runner_x86_64.rpm         ← NOT in git, in JFrog/Package Registry
-    └── gitlab-runner-helper-images.rpm  ← NOT in git, in JFrog/Package Registry
-```
-
-RPMs are binary files and should never be committed to git. They belong in a binary artifact repository (JFrog Artifactory or GitLab Package Registry).
+**Why:** First attempt.  
+**Problems:** Missing `USER 1001`. Missing helper RPM. Used `rpm -ivh` not `dnf localinstall`.
 
 ---
 
-## OpenShift BuildConfig Setup
+### Version 2 — Added USER and Helper RPM
 
-### Why BuildConfig Instead of docker push
+```dockerfile
+FROM ubi9:latest
 
-In an air-gapped environment, `docker push` from your workstation to OpenShift's internal registry is blocked by the firewall. BuildConfig solves this by having OpenShift pull the source and build the image internally — no external push required.
+COPY gitlab-runner_x86_64.rpm /tmp/gitlab-runner.rpm
+COPY gitlab-runner-helper-images.rpm /tmp/gitlab-runner-helper-images.rpm
+
+RUN rpm -ivh /tmp/gitlab-runner.rpm && \
+    rpm -ivh /tmp/gitlab-runner-helper-images.rpm && \
+    rm -f /tmp/gitlab-runner.rpm && \
+    rm -f /tmp/gitlab-runner-helper-images.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+USER 1001
+
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+**Why:** Added `USER 1001` for OpenShift SCC. Added helper RPM for GitLab Runner 17.  
+**Problems:** RPMs were 263-byte HTML error files from Package Registry (token was empty during upload).
+
+---
+
+### Version 3 — Package Registry Download with ARGs
+
+```dockerfile
+FROM ubi9:latest
+
+ARG GITLAB_TOKEN
+ARG PROJECT_ID
+
+RUN curl --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner_x86_64.rpm" \
+    -o /tmp/gitlab-runner.rpm && \
+    curl --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner-helper-images.rpm" \
+    -o /tmp/gitlab-runner-helper-images.rpm && \
+    yum install -y /tmp/gitlab-runner.rpm \
+                   /tmp/gitlab-runner-helper-images.rpm && \
+    yum clean all && \
+    rm -f /tmp/*.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+USER 1001
+
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+**Why:** Download RPMs from Package Registry during build instead of COPY.  
+**Problems:** `GITLAB_TOKEN` triggered GitLab secret push scanner → `pre-receive hook declined`. Variables empty in build.
+
+---
+
+### Version 4 — Renamed to PKG_TOKEN
+
+```bash
+# Used sed to rename all occurrences
+sed -i 's/GITLAB_TOKEN/PKG_TOKEN/g' Dockerfile
+```
+
+Result:
+
+```dockerfile
+FROM ubi9:latest
+
+ARG PKG_TOKEN
+ARG PROJECT_ID
+
+RUN curl --header "PRIVATE-TOKEN: ${PKG_TOKEN}" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner_x86_64.rpm" \
+    -o /tmp/gitlab-runner.rpm && \
+    curl --header "PRIVATE-TOKEN: ${PKG_TOKEN}" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner-helper-images.rpm" \
+    -o /tmp/gitlab-runner-helper-images.rpm && \
+    yum install -y /tmp/gitlab-runner.rpm \
+                   /tmp/gitlab-runner-helper-images.rpm && \
+    yum clean all && \
+    rm -f /tmp/*.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+USER 1001
+
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+**Why:** `GITLAB_TOKEN` matched GitLab's secret detection patterns even with no hardcoded value.  
+**Problems:** PROJECT_ID still empty. URL showed `/api/v4/projects//packages/...` (double slash = empty ID).
+
+---
+
+### Version 5 — Debug: Check Variables and File Sizes
+
+Added specifically to diagnose empty variables and wrong file sizes:
+
+```dockerfile
+FROM ubi9:latest
+
+ARG PKG_TOKEN
+ARG PROJECT_ID
+
+# Debug step: check if variables are actually reaching the build container
+# If TOKEN set: NO → secret injection is failing
+# If PROJECT_ID is wrong → secret key name mismatch
+RUN echo "TOKEN set: $(if [ -n "${PKG_TOKEN}" ]; then echo YES; else echo NO; fi)" && \
+    echo "PROJECT_ID: ${PROJECT_ID}"
+
+# Download runner RPM and immediately check its size
+# If size is < 1MB the download failed or returned an error response
+RUN curl --header "PRIVATE-TOKEN: ${PKG_TOKEN}" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner_x86_64.rpm" \
+    -o /tmp/gitlab-runner.rpm && \
+    echo "RPM size:" && \
+    ls -lh /tmp/gitlab-runner.rpm && \
+    file /tmp/gitlab-runner.rpm
+
+# Download helper RPM and check size
+RUN curl --header "PRIVATE-TOKEN: ${PKG_TOKEN}" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner-helper-images.rpm" \
+    -o /tmp/gitlab-runner-helper-images.rpm && \
+    echo "Helper size:" && \
+    ls -lh /tmp/gitlab-runner-helper-images.rpm
+
+RUN yum install -y /tmp/gitlab-runner.rpm \
+                   /tmp/gitlab-runner-helper-images.rpm && \
+    yum clean all && \
+    rm -f /tmp/*.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+USER 1001
+
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+**What the debug output revealed:**
 
 ```
-docker push approach (BLOCKED)
-Your machine → firewall → OpenShift registry ✗
+TOKEN set: NO          ← PKG_TOKEN empty — secret not being injected
+PROJECT_ID: 82861465   ← hardcoded value working fine
 
-BuildConfig approach (WORKS)
-Your machine → oc start-build → OpenShift builds internally → image in registry ✓
+RPM size:
+-rw-r--r--. 1 root root 106 Jun 4 /tmp/gitlab-runner.rpm
 ```
 
-### Two Ways to Trigger a BuildConfig
+106 bytes = curl downloaded without auth and received GitLab error JSON.
 
-**Option A: --from-dir (local folder)**
-Sends your local folder directly to OpenShift over the existing oc connection. No firewall issue because it uses the same channel as all oc commands. Best for: testing, air-gapped environments where RPMs can't be downloaded during build.
+Also revealed: `file` command does not exist in UBI9 → `exit status 127` (command not found) → build fails. Removed in next version.
+
+---
+
+### Version 6 — Verbose Curl for HTTP Status Debugging
+
+```dockerfile
+FROM ubi9:latest
+
+ARG PKG_TOKEN
+ARG PROJECT_ID
+
+RUN echo "TOKEN set: $(if [ -n "${PKG_TOKEN}" ]; then echo YES; else echo NO; fi)" && \
+    echo "PROJECT_ID: ${PROJECT_ID}"
+
+# -v shows full HTTP request/response headers including status code
+# Use this when you need to see exactly what the server returns
+RUN curl -v --header "PRIVATE-TOKEN: ${PKG_TOKEN}" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/gitlab-runner-rpms/17.11.0/gitlab-runner_x86_64.rpm" \
+    -o /tmp/gitlab-runner.rpm && \
+    echo "File size:" && \
+    ls -lh /tmp/gitlab-runner.rpm
+
+RUN yum install -y /tmp/gitlab-runner.rpm && \
+    yum clean all && \
+    rm -f /tmp/*.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+USER 1001
+
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+**What `curl -v` revealed:**
+
+Before PROJECT_ID fix:
+
+```
+> GET /api/v4/projects//packages/generic/...   ← double slash = empty PROJECT_ID
+< HTTP/2 308                                   ← redirect, not 200
+File size: 0 bytes
+```
+
+After PROJECT_ID hardcoded:
+
+```
+> GET /api/v4/projects/82861465/packages/generic/...  ← correct!
+< HTTP/2 200                                          ← success
+100   263  100   263    0     0   1301      0         ← only 263 bytes!
+```
+
+263 bytes with HTTP 200 = Package Registry stored the wrong file (HTML error that was uploaded when token was empty).
+
+---
+
+### Version 7 — S3 Direct Download (Bypassing Package Registry)
+
+```dockerfile
+FROM ubi9:latest
+
+RUN curl -L \
+    "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/rpm/gitlab-runner_x86_64.rpm" \
+    -o /tmp/gitlab-runner.rpm && \
+    curl -L \
+    "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/rpm/gitlab-runner-helper-images.rpm" \
+    -o /tmp/gitlab-runner-helper-images.rpm && \
+    yum install -y /tmp/gitlab-runner.rpm \
+                   /tmp/gitlab-runner-helper-images.rpm && \
+    yum clean all && \
+    rm -f /tmp/*.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+USER 1001
+
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+**Why:** Bypassed Package Registry entirely. No ARGs needed for public S3.  
+**Problems:** Developer Sandbox may restrict egress to S3. Files inside build container were still tiny even though local machine got 26MB successfully.
+
+---
+
+### Version 8 — COPY with Size Check After Copy
+
+```dockerfile
+FROM ubi9:latest
+
+COPY gitlab-runner_x86_64.rpm /tmp/gitlab-runner.rpm
+COPY gitlab-runner-helper-images.rpm /tmp/gitlab-runner-helper-images.rpm
+
+# Immediately check sizes after COPY
+# If sizes are tiny here — files were excluded from the upload
+# Most likely cause: .gitignore containing *.rpm
+RUN echo "Runner size:" && ls -lh /tmp/gitlab-runner.rpm && \
+    echo "Helper size:" && ls -lh /tmp/gitlab-runner-helper-images.rpm
+
+RUN yum install -y /tmp/gitlab-runner.rpm \
+                   /tmp/gitlab-runner-helper-images.rpm && \
+    yum clean all && \
+    rm -f /tmp/*.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+USER 1001
+
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+**Critical discovery:** `.gitignore` contained `*.rpm`. `oc start-build --from-dir` on a git repo folder respects `.gitignore` and excludes matching files. RPMs never made it into the build. COPY found 0-byte files.
+
+**Fix:**
+
+```bash
+rm .gitignore
+oc start-build gitlab-runner --from-dir=./folder --follow
+```
+
+---
+
+### Version 9 — Permissions Fix + dnf localinstall (Current)
+
+```dockerfile
+FROM ubi9:latest
+
+COPY gitlab-runner_x86_64.rpm /tmp/gitlab-runner.rpm
+COPY gitlab-runner-helper-images.rpm /tmp/gitlab-runner-helper-images.rpm
+
+# Fix file permissions after COPY
+# COPY may preserve source permissions which are not always 644
+# Without chmod: "Can not load RPM file" even when file is a valid RPM
+RUN chmod 644 /tmp/gitlab-runner.rpm \
+              /tmp/gitlab-runner-helper-images.rpm
+
+# Verify sizes — confirms files arrived with content
+RUN ls -lh /tmp/gitlab-runner.rpm /tmp/gitlab-runner-helper-images.rpm
+
+# dnf localinstall is the correct command for local RPM files
+# It handles dependencies automatically and is designed for this use case
+# dnf clean all removes yum cache — keeps image smaller
+RUN dnf localinstall -y /tmp/gitlab-runner.rpm \
+                        /tmp/gitlab-runner-helper-images.rpm && \
+    dnf clean all && \
+    rm -f /tmp/*.rpm
+
+RUN mkdir -p /etc/gitlab-runner /home/gitlab-runner
+
+# Non-root user — required for OpenShift SCC compliance
+USER 1001
+
+# Long-running process — keeps Deployment alive
+# If CMD exits for any reason Deployment will restart the pod
+CMD ["gitlab-runner", "run", \
+     "--working-directory", "/home/gitlab-runner", \
+     "--config", "/etc/gitlab-runner/config.toml"]
+```
+
+---
+
+## All Pivots and Why
+
+### Pivot 1: Deployment → Job
+
+**Trigger:** Deployment CrashLoopBackOff. Job worked.  
+**Root cause:** UBI9 base image has no CMD. Exits immediately. Deployment restarts it infinitely.  
+**Lesson:** Choose workload type based on what the container does. Script → Job. Server → Deployment.
+
+---
+
+### Pivot 2: docker push → BuildConfig
+
+**Trigger:** `docker push` to OpenShift registry timed out.  
+**Root cause:** Registry route crosses corporate firewall. Workstation subnet blocked.  
+**Fix:** BuildConfig builds internally over existing oc connection. No new firewall rules.
+
+---
+
+### Pivot 3: Generic Secret → Two Typed Secrets
+
+**Trigger:** `FetchSourceFailed` with credentials in secret.  
+**Root cause:** OpenShift requires `kubernetes.io/basic-auth` type with `username`/`password` keys for git auth. Generic Opaque is ignored.  
+**Fix:** `gitlab-git-auth` (basic-auth) for cloning, `gitlab-build-args` (Opaque) for build args.
+
+---
+
+### Pivot 4: GITLAB_TOKEN → PKG_TOKEN
+
+**Trigger:** `pre-receive hook declined` on git push.  
+**Root cause:** GitLab secret push scanner flagged `GITLAB_TOKEN` as suspicious variable name pattern, even without hardcoded value.  
+**Fix:** `sed -i 's/GITLAB_TOKEN/PKG_TOKEN/g' Dockerfile`
+
+---
+
+### Pivot 5: secretKeyRef → hardcoded PROJECT_ID
+
+**Trigger:** PROJECT_ID always empty inside builds. URL showed double slash.  
+**Root cause:** `valueFrom.secretKeyRef` unreliable in Sandbox. Key name `project-id` (hyphen) may cause shell issues.  
+**Fix:** PROJECT_ID is not sensitive. Hardcode in BuildConfig: `value: "82861465"`
+
+---
+
+### Pivot 6: Making Repo Public (Temporary)
+
+**Trigger:** Multiple `FetchSourceFailed` errors.  
+**Purpose:** Remove auth from the equation to confirm URL was correct.  
+**What it revealed:** URL was correct. Issue was secret type.  
+**Lesson:** Infrastructure repos should never be public. Debugging technique only.
+
+---
+
+### Pivot 7: Package Registry Download → --from-dir
+
+**Trigger chain:**
+
+1. Token empty → curl saved HTML as RPM → yum can't install
+2. Token revoked/regenerated → wrong scopes
+3. Package Registry disabled → 403
+4. Re-enabled → S3 version URL returned AccessDenied
+5. Used `latest` URL locally → 26MB, worked
+6. Same URL inside build container → tiny file (Sandbox egress blocked)
+   **Fix:** `oc start-build --from-dir` sends local files (correctly 26MB/515MB) over oc connection. Bypasses all Package Registry and S3 issues.
 
 ```bash
 oc start-build gitlab-runner \
-  --from-dir=~/gitlab-runner-build \
+  --from-dir=~/gitlab-runner-build/my-openshift \
   --follow
-```
-
-**Option B: Git source (production approach)**
-BuildConfig watches a GitLab repo and builds when changes are pushed. Dockerfile is in git. RPMs are downloaded from JFrog/Package Registry during the build using credentials from secrets.
-
-### Setting Up Secrets
-
-Two separate secrets are needed for different purposes:
-
-```bash
-# Secret 1 — for git source authentication
-# Type must be kubernetes.io/basic-auth for OpenShift git cloning
-# username and password are the required key names for this type
-oc create secret generic gitlab-git-auth \
-  --type=kubernetes.io/basic-auth \
-  --from-literal=username=your-gitlab-username \
-  --from-literal=password=${GITLAB_TOKEN} \
-  -n your-namespace
-
-# Annotate so OpenShift knows which URLs this secret applies to
-oc annotate secret gitlab-git-auth \
-  "build.openshift.io/source-secret-match-uri-1=https://gitlab.com/*" \
-  -n your-namespace
-
-# Secret 2 — for build args (passed into Dockerfile ARGs)
-# Type is Opaque (generic) — just key-value pairs
-# Key names must exactly match what BuildConfig references
-oc create secret generic gitlab-build-args \
-  --from-literal=token=${GITLAB_TOKEN} \
-  --from-literal=project_id=${PROJECT_ID} \
-  -n your-namespace
-```
-
-### Creating the ImageStream
-
-The ImageStream must exist before the build runs. It is where the finished image is stored in the internal registry.
-
-```bash
-oc create imagestream gitlab-runner -n your-namespace
-```
-
-### The BuildConfig YAML
-
-```yaml
-apiVersion: build.openshift.io/v1
-kind: BuildConfig
-metadata:
-  name: gitlab-runner
-  namespace: your-namespace
-spec:
-  source:
-    type: Git
-    git:
-      uri: "https://gitlab.com/your-username/your-repo.git"
-      ref: main
-    sourceSecret:
-      name: gitlab-git-auth # uses the basic-auth secret for cloning
-  strategy:
-    type: Docker
-    dockerStrategy:
-      buildArgs:
-        - name: PKG_TOKEN # maps to ARG PKG_TOKEN in Dockerfile
-          valueFrom:
-            secretKeyRef:
-              name: gitlab-build-args
-              key: token # must match key name in secret exactly
-        - name: PROJECT_ID # maps to ARG PROJECT_ID in Dockerfile
-          value: "82861465" # hardcoded because it is not sensitive
-  output:
-    to:
-      kind: ImageStreamTag
-      name: "gitlab-runner:latest" # destination ImageStream
-```
-
-Apply and trigger:
-
-```bash
-oc apply -f buildconfig.yaml
-oc start-build gitlab-runner --follow
 ```
 
 ---
 
-## Deploying the Runner
+### Pivot 8: yum install → dnf localinstall + chmod
 
-### ServiceAccount and Permissions
+**Trigger:** `Can not load RPM file` with valid RPM files.  
+**Root cause:** File permissions after COPY may not be 644. `yum install` not ideal for local files.  
+**Fix:**
 
-The runner pod needs permission to create other pods (for pipeline jobs):
+```dockerfile
+RUN chmod 644 /tmp/*.rpm
+RUN dnf localinstall -y /tmp/gitlab-runner.rpm /tmp/gitlab-runner-helper-images.rpm
+```
+
+---
+
+### Pivot 9: .gitignore Removal
+
+**Trigger:** COPY finding 0-byte or wrong files despite 26MB/515MB files being in folder.  
+**Root cause:** `.gitignore` contained `*.rpm`. `oc start-build --from-dir` respects `.gitignore` on git repo folders. RPMs excluded before upload.  
+**Fix:**
 
 ```bash
-# Create dedicated service account
-oc create serviceaccount gitlab-runner -n your-namespace
+rm .gitignore
+```
 
-# Allow it to create and manage pods
+---
+
+## Deployment Setup
+
+### ServiceAccount
+
+```bash
+oc create serviceaccount gitlab-runner -n aaroncodes-dev
+
+# Permission to create and manage pods (needed for pipeline job pods)
 oc adm policy add-role-to-user edit \
-  -z gitlab-runner -n your-namespace
+  -z gitlab-runner -n aaroncodes-dev
 
-# Allow non-root execution
-# Note: requires cluster-admin — may be restricted in Developer Sandbox
+# Allow non-root execution (requires cluster-admin — may be restricted in Sandbox)
 oc adm policy add-scc-to-user anyuid \
-  -z gitlab-runner -n your-namespace
+  -z gitlab-runner -n aaroncodes-dev
 ```
 
 ### config.toml
 
 ```toml
-concurrent = 4          # max simultaneous pipeline jobs
-check_interval = 0      # how often runner polls GitLab (0 = default)
+concurrent = 4
+check_interval = 0
 
 [[runners]]
   name = "openshift-runner"
   url = "http://your-internal-gitlab-url"
   token = "your-runner-registration-token"
 
-  # clone_url overrides the URL used to clone repos during jobs
-  # Critical in air-gapped environments where the advertised
-  # GitLab URL may not be reachable from inside cluster pods
+  # Overrides the URL used to clone repos during pipeline jobs
+  # Without this: runner uses GitLab's advertised URL
+  # In air-gapped envs that URL may be external and unreachable from pods
   clone_url = "http://your-internal-gitlab-url"
 
-  executor = "kubernetes"   # creates a new pod per pipeline job
+  executor = "kubernetes"
 
   [runners.kubernetes]
-    namespace = "your-namespace"
+    namespace = "aaroncodes-dev"
     service_account = "gitlab-runner"
 
-    # Default image for jobs that don't specify their own
-    # Points to internal registry — never needs internet
-    image = "image-registry.openshift-image-registry.svc:5000/your-namespace/ubi9:latest"
+    # Default image when pipeline does not specify one
+    # Internal registry address — never needs internet
+    image = "image-registry.openshift-image-registry.svc:5000/aaroncodes-dev/ubi9:latest"
 
-    # Helper image handles: git clone, artifact upload, cache
-    # Must be internal in air-gapped environment
-    helper_image = "image-registry.openshift-image-registry.svc:5000/your-namespace/gitlab-runner:latest"
+    # Helper handles: git clone, artifact upload, cache
+    # Points to the runner image we just built
+    helper_image = "image-registry.openshift-image-registry.svc:5000/aaroncodes-dev/gitlab-runner:latest"
 ```
 
 ### ConfigMap
 
 ```bash
-# Create ConfigMap from the config.toml file
-# ConfigMap mounts the file into the pod at /etc/gitlab-runner/config.toml
+# Mounts config.toml into the runner pod at /etc/gitlab-runner/config.toml
+# The CMD in our Dockerfile reads from this exact path
 oc create configmap gitlab-runner-config \
   --from-file=config.toml \
-  -n your-namespace
+  -n aaroncodes-dev
 ```
 
 ### Deployment YAML
 
-```yaml
+```bash
+cat > runner-deployment.yaml << 'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gitlab-runner
-  namespace: your-namespace
+  namespace: aaroncodes-dev
 spec:
   replicas: 1
   selector:
@@ -632,111 +1080,59 @@ spec:
       serviceAccountName: gitlab-runner
       containers:
         - name: gitlab-runner
-          # Points to internal registry — no internet needed
-          image: image-registry.openshift-image-registry.svc:5000/your-namespace/gitlab-runner:latest
+          # Internal registry address — only accessible from within cluster
+          # Cannot be used from outside the cluster
+          image: image-registry.openshift-image-registry.svc:5000/aaroncodes-dev/gitlab-runner:latest
           volumeMounts:
             - name: config
-              mountPath: /etc/gitlab-runner # where runner reads config.toml
+              mountPath: /etc/gitlab-runner
       volumes:
         - name: config
           configMap:
-            name: gitlab-runner-config # the ConfigMap we created
+            name: gitlab-runner-config
+EOF
+
+oc apply -f runner-deployment.yaml
+```
+
+### Verify
+
+```bash
+oc get pods -n aaroncodes-dev
+# NAME                             READY   STATUS    RESTARTS
+# gitlab-runner-6d8f9b7c4-xk2pq   1/1     Running   0
+
+oc logs deployment/gitlab-runner -n aaroncodes-dev
+# Configuration loaded    builds=0
+# Listening for jobs
+```
+
+### Test Pipeline
+
+```yaml
+# .gitlab-ci.yml in any repo
+test-job:
+  image: python:3.11 # teams bring their own image
+  script:
+    - echo "Running in my image via OpenShift runner"
+    - hostname # shows pod name
+    - whoami # should show non-root user
 ```
 
 ```bash
-oc apply -f runner-deployment.yaml
-
-# Verify
-oc get pods -n your-namespace
-oc logs deployment/gitlab-runner -n your-namespace
-```
-
-Healthy logs look like:
-
-```
-Configuration loaded    builds=0
-Listening for jobs
+# Watch job pods appear and disappear as pipeline runs
+oc get pods -w -n aaroncodes-dev
 ```
 
 ---
 
-## Pivots and Why We Made Them
-
-### Pivot 1: Job Instead of Deployment (Initial Discovery)
-
-**What happened:** The first Deployment kept CrashLoopBackOff-ing. A Job worked fine.
-
-**Why:** The image being tested was a UBI9 base image with no long-running CMD. It started, did nothing, and exited with code 0. A Job celebrates that as success. A Deployment panics and restarts it in a loop.
-
-**Lesson:** Always ask "does this container run forever or does it finish?" before choosing Deployment vs Job.
-
-### Pivot 2: BuildConfig Instead of docker push
-
-**What happened:** Tried to `docker push` a locally built image into OpenShift's registry. Got connection refused / timeout.
-
-**Why:** OpenShift's registry route is exposed on a URL that goes through the corporate firewall. The firewall blocks this traffic from the workstation subnet.
-
-**Fix:** BuildConfig builds the image inside OpenShift — no external push needed. The build output goes directly into the internal registry.
-
-### Pivot 3: --from-dir Instead of Git Source
-
-**What happened:** BuildConfig with Git source kept failing with `FetchSourceFailed` and authentication errors (403).
-
-**Why — multiple causes:**
-
-1. Private repo with group access tokens disabled
-2. Personal token format causing URL parse errors (special characters interpreted as port numbers)
-3. Token scope mismatches between git cloning and Package Registry uploads
-   **Fix:** `oc start-build --from-dir` bypasses git entirely. It sends the local folder over the existing oc connection which is already authenticated. No git credentials needed.
-
-**Important note:** `--from-dir` respects `.gitignore`. If `*.rpm` is in `.gitignore`, the RPMs will be excluded and the build will fail with "Can not load RPM file". Remove `.gitignore` before running `--from-dir` builds.
-
-### Pivot 4: Making the Repo Public (Temporary)
-
-**What happened:** After multiple 403 errors on git clone, we temporarily made the repo public to isolate whether the issue was auth or something else.
-
-**Why it was needed:** The 403 errors were masking the real issue (URL format with token containing special characters). By removing auth from the equation, we confirmed the repo URL itself was correct and the issue was purely authentication.
-
-**What to do in production:** Never make a repo containing infrastructure code public. Use SSH keys or a properly scoped deploy token instead of personal access tokens for BuildConfig git sources.
-
-### Pivot 5: PKG_TOKEN Instead of GITLAB_TOKEN
-
-**What happened:** Pushed Dockerfile with `ARG GITLAB_TOKEN` to GitLab. Got `pre-receive hook declined`.
-
-**Why:** GitLab has secret push protection that scans for patterns matching known secret formats. `GITLAB_TOKEN` as a variable name triggered the secret scanner even though no actual token value was hardcoded.
-
-**Fix:** Renamed the ARG to `PKG_TOKEN` which doesn't match GitLab's secret detection patterns.
-
-### Pivot 6: Hardcoding PROJECT_ID in BuildConfig
-
-**What happened:** PROJECT_ID was always empty inside the build despite the secret having the correct value.
-
-**Why:** The `valueFrom.secretKeyRef` mechanism for build args has reliability issues in some OpenShift versions and sandbox environments. The secret key name `project-id` (with hyphen) may also cause shell variable issues since hyphens are not valid in shell variable names.
-
-**Fix:** PROJECT_ID is not sensitive information (it is just a number visible in the GitLab URL). Hardcoding it directly as a `value` in the BuildConfig is simpler and more reliable than referencing a secret.
-
-### Pivot 7: Separate Secrets for Git Auth vs Build Args
-
-**What happened:** Used one generic secret for both git cloning and build args. Git cloning kept failing.
-
-**Why:** OpenShift requires `type: kubernetes.io/basic-auth` with specific keys (`username` and `password`) for git source secrets. A generic Opaque secret with different key names is ignored for git auth even if the credentials are correct.
-
-**Fix:** Two separate secrets:
-
-- `gitlab-git-auth` — type `kubernetes.io/basic-auth` for git cloning
-- `gitlab-build-args` — type `Opaque` for Dockerfile ARG injection
-
----
-
-## Enterprise JFrog Example
-
-This section describes the production setup for an air-gapped environment where JFrog Artifactory is the artifact repository instead of GitLab Package Registry.
+## Enterprise JFrog Version
 
 ### Architecture
 
 ```
-JFrog Artifactory (internal)
-  └── generic-repo/
+JFrog Artifactory (internal, air-gapped)
+  └── rpm-local/
         ├── gitlab-runner_x86_64.rpm
         └── gitlab-runner-helper-images.rpm
 
@@ -744,74 +1140,78 @@ GitLab (internal)
   └── openshift-gitlab-runner/
         └── Dockerfile
 
-OpenShift (ROSA on AWS — air-gapped)
-  └── BuildConfig watches GitLab
-  └── During build, pulls RPMs from JFrog
-  └── Builds image internally
-  └── Stores in internal registry
+OpenShift ROSA (air-gapped)
+  └── BuildConfig watches GitLab repo
+  └── Build downloads RPMs from JFrog using API key
+  └── Image built internally
+  └── Runner Deployment active
 ```
 
 ### JFrog Authentication
 
-In air-gapped enterprise environments, use an **API key** not an identity token.
+**Use API key not identity token in air-gapped environments:**
 
-|                  | API Key     | Identity Token                    |
-| ---------------- | ----------- | --------------------------------- |
-| Lifespan         | Long-lived  | Short-lived (hours)               |
-| Air-gap safe     | Yes         | No (OIDC callback may be blocked) |
-| For pull secrets | Best choice | Will expire and break pulls       |
-
-Generate API key:
+|              | API Key                 | Identity Token             |
+| ------------ | ----------------------- | -------------------------- |
+| Lifespan     | Long-lived              | Short-lived (hours)        |
+| Air-gap safe | Yes                     | No — OIDC callback blocked |
+| Pull secrets | Set once, works forever | Expires, breaks pulls      |
 
 ```
 JFrog UI → top right avatar → Edit Profile
 → Authentication Settings → Generate API Key
 ```
 
-### JFrog Pull Secret for Image Pulls
+### Upload RPMs to JFrog
 
-If your base image (UBI9) is stored in JFrog:
+```bash
+curl -u your-username:${JFROG_TOKEN} \
+  -T gitlab-runner_x86_64.rpm \
+  "https://${JFROG_URL}/artifactory/rpm-local/gitlab-runner_x86_64.rpm"
+
+curl -u your-username:${JFROG_TOKEN} \
+  -T gitlab-runner-helper-images.rpm \
+  "https://${JFROG_URL}/artifactory/rpm-local/gitlab-runner-helper-images.rpm"
+```
+
+### JFrog Pull Secret
 
 ```bash
 oc create secret docker-registry jfrog-pull-secret \
-  --docker-server=your-instance.jfrog.io \
+  --docker-server=${JFROG_URL} \
   --docker-username=your-username \
   --docker-password=${JFROG_TOKEN} \
   -n your-namespace
 
-# Link to service account so all pods can pull
 oc secrets link default jfrog-pull-secret --for=pull -n your-namespace
 ```
 
-### JFrog Credentials Secret for Build
+### JFrog Build Credentials Secret
 
 ```bash
 oc create secret generic jfrog-build-credentials \
-  --from-literal=username=your-jfrog-username \
+  --from-literal=username=your-username \
   --from-literal=token=${JFROG_TOKEN} \
-  --from-literal=url=your-instance.jfrog.io \
+  --from-literal=url=${JFROG_URL} \
   -n your-namespace
 ```
 
-### The Dockerfile (JFrog Version)
+### Dockerfile (JFrog Version)
 
 ```dockerfile
 FROM your-instance.jfrog.io/docker-local/ubi9:latest
 
-# Build args injected from OpenShift secrets at build time
-# ARG variables exist ONLY during build — not at runtime
 ARG JFROG_USER
 ARG JFROG_TOKEN
 ARG JFROG_URL
 
-# Download RPMs from JFrog using API key authentication
-# -f flag: fail immediately on HTTP error instead of saving error HTML as RPM
-# Without -f, a 403 response gets saved as the RPM file and yum install fails silently
+# -f flag: fail immediately on HTTP errors — learned the hard way
+# without -f curl saves error HTML as the RPM file silently
 RUN curl -f -u "${JFROG_USER}:${JFROG_TOKEN}" \
-    "https://${JFROG_URL}/artifactory/rpm-repo/gitlab-runner_x86_64.rpm" \
+    "https://${JFROG_URL}/artifactory/rpm-local/gitlab-runner_x86_64.rpm" \
     -o /tmp/gitlab-runner.rpm && \
     curl -f -u "${JFROG_USER}:${JFROG_TOKEN}" \
-    "https://${JFROG_URL}/artifactory/rpm-repo/gitlab-runner-helper-images.rpm" \
+    "https://${JFROG_URL}/artifactory/rpm-local/gitlab-runner-helper-images.rpm" \
     -o /tmp/gitlab-runner-helper-images.rpm
 
 RUN chmod 644 /tmp/gitlab-runner.rpm /tmp/gitlab-runner-helper-images.rpm
@@ -830,7 +1230,7 @@ CMD ["gitlab-runner", "run", \
      "--config", "/etc/gitlab-runner/config.toml"]
 ```
 
-### The BuildConfig (JFrog Version)
+### BuildConfig (JFrog Version)
 
 ```yaml
 apiVersion: build.openshift.io/v1
@@ -842,10 +1242,10 @@ spec:
   source:
     type: Git
     git:
-      uri: "https://your-internal-gitlab/your-group/openshift-gitlab-runner.git"
+      uri: "https://your-internal-gitlab/group/openshift-gitlab-runner.git"
       ref: main
     sourceSecret:
-      name: gitlab-git-auth # basic-auth secret for internal GitLab
+      name: gitlab-git-auth
   strategy:
     type: Docker
     dockerStrategy:
@@ -871,7 +1271,7 @@ spec:
       name: "gitlab-runner:latest"
 ```
 
-### config.toml (Air-Gapped JFrog Version)
+### config.toml (JFrog Version)
 
 ```toml
 concurrent = 4
@@ -887,45 +1287,11 @@ check_interval = 0
   [runners.kubernetes]
     namespace = "your-namespace"
     service_account = "gitlab-runner"
-
-    # Both images point to internal registry
-    # Nodes never need to reach JFrog or internet at runtime
     image = "image-registry.openshift-image-registry.svc:5000/your-namespace/ubi9:latest"
     helper_image = "image-registry.openshift-image-registry.svc:5000/your-namespace/gitlab-runner:latest"
 
-    # JFrog pull secret allows job pods to pull custom images from JFrog
     [[runners.kubernetes.image_pull_secrets]]
       name = "jfrog-pull-secret"
-```
-
-### Full Enterprise Flow
-
-```
-1. Developer pushes Dockerfile change to internal GitLab
-         │
-         │  webhook triggers BuildConfig
-         ▼
-2. OpenShift BuildConfig clones Dockerfile from GitLab
-         │
-         │  using gitlab-git-auth secret (basic-auth)
-         ▼
-3. Build pod starts
-         │
-         │  downloads RPMs from JFrog using JFROG_TOKEN build arg
-         │  installs them onto UBI9
-         │  builds the image
-         ▼
-4. Image pushed to OpenShift internal registry
-         │
-         │  ImageStream updated to point to new image
-         ▼
-5. Deployment detects new image, rolling update
-         │
-         ▼
-6. New runner pod starts, connects to internal GitLab ✓
-         │
-         ▼
-7. Teams run pipelines using their own images from JFrog ✓
 ```
 
 ---
@@ -935,107 +1301,85 @@ check_interval = 0
 ### CrashLoopBackOff
 
 ```bash
-# Get exit code
-oc describe pod <pod-name> | grep -A5 "Last State"
-
-# Exit code meanings:
-# 0   = success (wrong workload type — use Job not Deployment)
-# 1   = app crashed (check logs)
-# 126 = permission denied on entrypoint
-# 127 = binary not found
-# 137 = OOMKilled (increase memory limit)
+oc describe pod <pod-name> -n your-namespace | grep -A5 "Last State"
+# Exit Code: 0   = exited successfully (use Job not Deployment)
+# Exit Code: 1   = app crashed (check logs)
+# Exit Code: 126 = permission denied on entrypoint
+# Exit Code: 127 = binary not found
+# Exit Code: 137 = OOMKilled
 ```
 
 ### Empty Logs on CrashLoopBackOff
 
-Container is dying before the app starts. Almost always a root user blocked by SCC.
+Container dying before app starts. Almost always SCC blocking root.
 
 ```bash
-# Fix: ensure USER 1001 is in Dockerfile
-# Or temporarily grant anyuid (requires cluster-admin)
-oc adm policy add-scc-to-user anyuid -z default -n your-namespace
-```
-
-### ImagePullBackOff / ErrImagePull
-
-```bash
-oc describe pod <pod-name> | grep -A10 Events
-
-# Common causes:
-# 1. No pull secret configured
-# 2. Wrong registry URL
-# 3. Image doesn't exist at that tag
-# 4. Registry not reachable from nodes
-```
-
-### BuildConfig FetchSourceFailed
-
-```bash
-oc logs build/<build-name>
-
-# Common causes:
-# 1. Wrong git URL
-# 2. Missing or wrong sourceSecret
-# 3. Secret type must be kubernetes.io/basic-auth
-# 4. Token lacks read_repository scope
-# 5. Repo visibility is private without proper credentials
+oc get events -n your-namespace --sort-by='.lastTimestamp'
+# Fix: ensure USER 1001 in Dockerfile
 ```
 
 ### Can Not Load RPM File
 
 ```bash
-# Verify the RPM is a valid file
-head -c 4 your-file.rpm | xxd
+# 1. Check magic bytes
+head -c 4 file.rpm | xxd
 # Valid RPM: ed ab ee db
 
-# Fix permissions
+# 2. Fix permissions
 chmod 644 /tmp/*.rpm
 
-# Use dnf localinstall not yum install
-dnf localinstall -y /tmp/gitlab-runner.rpm
+# 3. Remove .gitignore if using --from-dir
+rm .gitignore
 
-# Check .gitignore is not excluding RPMs from --from-dir builds
-cat .gitignore
-# If *.rpm is listed, remove .gitignore before running --from-dir
+# 4. Use dnf localinstall
+dnf localinstall -y /tmp/file.rpm
+
+# 5. Check if file is HTML error
+head -c 100 /tmp/file.rpm
+# Valid: binary data
+# Invalid: <!DOCTYPE html> or {"message":"..."}
 ```
 
-### Build Args Empty Inside Build
+### Build Args Empty in Build
 
 ```bash
-# Verify secret has values
-oc get secret your-secret -o jsonpath='{.data.your-key}' | base64 -d
+# Add debug RUN to Dockerfile
+RUN echo "TOKEN set: $(if [ -n "${PKG_TOKEN}" ]; then echo YES; else echo NO; fi)" && \
+    echo "PROJECT_ID: ${PROJECT_ID}"
 
-# Verify BuildConfig references correct secret and key names
-oc get buildconfig your-bc -o jsonpath='{.spec.strategy.dockerStrategy.buildArgs}'
+# If TOKEN: NO — verify secret has value
+oc get secret gitlab-build-args \
+  -o jsonpath='{.data.token}' -n aaroncodes-dev | base64 -d | wc -c
 
-# Key names must match exactly — project-id in secret must match project-id in BuildConfig
-# Hyphens in key names can cause issues — prefer underscores
-
-# For non-sensitive values like PROJECT_ID, hardcode directly instead of secret reference
+# For non-sensitive values, hardcode in BuildConfig instead
+- name: PROJECT_ID
+  value: "82861465"
 ```
 
-### 403 on Package Registry Upload
+### FetchSourceFailed
 
 ```bash
-# Token must have write_package_registry scope
-# OR api scope (which covers everything including package registry)
-# Create new token at: GitLab → Preferences → Access Tokens
-# Check: api scope
+# Check secret type
+oc get secret gitlab-git-auth -o jsonpath='{.type}'
+# Must return: kubernetes.io/basic-auth
+
+# Check secret keys
+oc get secret gitlab-git-auth -o jsonpath='{.data}'
+# Must have: username and password
 ```
 
-### Token in URL Causing Port Error
-
-```
-URL rejected: Port number was not a decimal number between 0 and 65535
-```
-
-Token contains special characters (`:`, `@`) being parsed as URL components.
+### curl Downloading Wrong Content
 
 ```bash
-# Fix: use git credential helper instead of embedding token in URL
-git config --global credential.helper store
-git clone https://gitlab.com/username/repo.git
-# Enter username and token when prompted
+# Always use -f to fail on HTTP errors
+curl -f --header "PRIVATE-TOKEN: ${TOKEN}" URL -o file.rpm
+
+# Use -v to see HTTP status
+curl -v --header "PRIVATE-TOKEN: ${TOKEN}" URL -o file.rpm
+# < HTTP/2 200 = good
+# < HTTP/2 401 = auth failed, empty token
+# < HTTP/2 403 = permission denied
+# < HTTP/2 404 = wrong URL
 ```
 
 ---
@@ -1043,34 +1387,57 @@ git clone https://gitlab.com/username/repo.git
 ## Quick Reference Commands
 
 ```bash
-# Build from local folder (bypasses all git/auth issues)
-oc start-build gitlab-runner --from-dir=./your-folder --follow
+# Build from local folder — bypasses git/auth/firewall entirely
+oc start-build gitlab-runner --from-dir=./folder --follow
 
-# Check build status
+# Check builds
 oc get builds
 
 # Get build logs
 oc logs build/gitlab-runner-N
 
-# Check running pods
-oc get pods -n your-namespace
+# Get all logs from start
+oc logs build/gitlab-runner-N 2>&1 | head -50
+
+# Check pods
+oc get pods -n aaroncodes-dev
 
 # Watch pods in real time
-oc get pods -w -n your-namespace
+oc get pods -w -n aaroncodes-dev
 
-# Get pod logs
-oc logs deployment/gitlab-runner -n your-namespace
+# Pod logs
+oc logs deployment/gitlab-runner -n aaroncodes-dev
 
-# Describe pod (shows events and errors)
-oc describe pod <pod-name> -n your-namespace
+# Logs from previous crashed container
+oc logs <pod-name> --previous -n aaroncodes-dev
+
+# Describe pod — shows events and errors
+oc describe pod <pod-name> -n aaroncodes-dev
 
 # Check secrets
-oc get secrets -n your-namespace
-oc get secret <secret-name> -o jsonpath='{.data.<key>}' | base64 -d
+oc get secrets -n aaroncodes-dev
+oc get secret <name> -o jsonpath='{.data.<key>}' | base64 -d
 
 # Check imagestream
-oc get imagestream -n your-namespace
+oc get imagestream -n aaroncodes-dev
+
+# Check buildconfig
+oc get buildconfig gitlab-runner -o yaml
+
+# Patch buildconfig buildArgs
+oc get buildconfig gitlab-runner \
+  -o jsonpath='{.spec.strategy.dockerStrategy.buildArgs}'
 
 # Cancel a build
 oc cancel-build gitlab-runner-N
+
+# Delete and recreate a secret
+oc delete secret <name> -n aaroncodes-dev
+oc create secret generic <name> --from-literal=key=value -n aaroncodes-dev
+
+# Check events
+oc get events --sort-by='.lastTimestamp' -n aaroncodes-dev
+
+# Exec into pod for debugging
+oc exec -it <pod-name> -- /bin/sh -n aaroncodes-dev
 ```
